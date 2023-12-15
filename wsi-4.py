@@ -1,129 +1,153 @@
-import numpy as np
-from cvxopt import matrix, solvers
+from cvxopt import matrix
+from cvxopt.solvers import qp
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import OrdinalEncoder, MinMaxScaler
-import matplotlib.pyplot as plt
+from dataclasses import dataclass
 import pandas as pd
-from sklearn.svm import SVC
-from sklearn.metrics import precision_score, recall_score, accuracy_score, confusion_matrix
+import numpy as np
+
 
 class Kernel:
     def __init__(self):
         self.func = None
 
+    def __call__(self, xi, xj):
+        if self.func is not None:
+            return self.func(xi, xj)
+        else:
+            raise NotImplementedError("Kernel function is not defined.")
+
+
 class LinearKernel(Kernel):
     def __init__(self):
-        self.func = lambda x, y: np.dot(x.T, y)
+        self.func = lambda xi, xj: np.dot(xi.T, xj)
 
 
 class RBFKernel(Kernel):
     def __init__(self, gamma):
         self.gamma = gamma
-        self.func = lambda x, y: np.exp(-self.gamma * np.linalg.norm(x-y)**2)
-        
+        self.func = lambda xi, xj: np.exp(-self.gamma * np.linalg.norm(xi - xj) ** 2)
+
+
 class PolyKernel(Kernel):
-    def __init__(self,c,d):
+    def __init__(self, c, d):
         self.c = c
         self.d = d
-        self.func = lambda x, y: pow((np.dot(x, y) + self.c), self.d)
+        self.func = lambda xi, xj: pow((np.dot(xi, xj) + self.c), self.d)
+
+
+@dataclass
+class params_t:
+    file_name: str
+    column_name: str
+    minimum_quality: int
+
+
+@dataclass
+class hiperparams_t:
+    kernel: Kernel = LinearKernel
+    C: float = 1
 
 
 class SVM:
-    def __init__(self, kernel, C=1):
-        self.kernel = kernel
-        self.C = C
+    def __init__(self, hiperparams: hiperparams_t):
+        self.kernel = hiperparams.kernel
+        self.C = hiperparams.C
+        self.bias = 0
+        self.K = np.array([])
+
+    def calculate_K_matrix(self, X):
+        number_of_samples, _ = X.shape
+        self.K = np.array(
+            [
+                [self.kernel(X[i], X[j]) for j in range(number_of_samples)]
+                for i in range(number_of_samples)
+            ]
+        )
+
+    def calculate_bias_svm(self, support_vectors, ids_support_vectors):
+        for i in range(len(self.alphas)):
+            self.bias += self.support_vect_y[i]
+            self.bias -= np.sum(
+                self.alphas
+                * self.support_vect_y
+                * self.K[ids_support_vectors[i], support_vectors]
+            )
+        self.bias /= len(self.alphas)
 
     def fit(self, X, y):
-        n_samples, n_features = X.shape
+        number_of_samples, _ = X.shape
+        self.calculate_K_matrix(X)
 
-        K = np.zeros((n_samples, n_samples))
-        for i in range(n_samples):
-            for j in range(n_samples):
-                K[i, j] = self.kernel.func(X[i], X[j])
-
-        P = matrix(np.outer(y, y) * K)
-        q = matrix(-1 * np.ones(n_samples))
-
-        G = matrix(np.vstack((np.eye(n_samples) * -1, np.eye(n_samples))))
-        h = matrix(np.hstack((np.zeros(n_samples), np.ones(n_samples) * self.C)))
-
-        A = matrix(y.reshape(1, -1).astype('double'), (1, n_samples))
+        P = matrix(np.outer(y, y) * self.K)
+        A = matrix(y.reshape(1, -1).astype("double"), (1, number_of_samples))
+        q = matrix(-1 * np.ones(number_of_samples))
         b = matrix(0.0)
+        G = matrix(
+            np.vstack((np.eye(number_of_samples) * -1, np.eye(number_of_samples)))
+        )
+        h = matrix(
+            np.hstack(
+                (np.zeros(number_of_samples), np.ones(number_of_samples) * self.C)
+            )
+        )
 
-        sol = solvers.qp(P, q, G, h, A, b)
+        result = qp(P, q, G, h, A, b)
+        alphas = np.ravel(result["x"])
 
-        a = np.ravel(sol["x"])
+        support_vectors = alphas > 1e-6
+        ids_support_vectors = np.arange(len(alphas))[support_vectors]
+        self.alphas = alphas[support_vectors]
+        self.support_vect_x = X[support_vectors]
+        self.support_vect_y = y[support_vectors]
 
-        sv = a > 1e-5
-        ind = np.arange(len(a))[sv]
-        self.a = a[sv]
-        self.sv = X[sv]
-        self.sv_y = y[sv]
-        self.b = 0
-        for n in range(len(self.a)):
-            self.b += self.sv_y[n]
-            self.b -= np.sum(self.a * self.sv_y * K[ind[n], sv])
-        self.b /= len(self.a)
+        self.calculate_bias_svm(support_vectors, ids_support_vectors)
 
     def predict(self, X):
         return np.sign(self.decision_function(X))
 
     def decision_function(self, X):
         y_predict = np.zeros(len(X))
-        for i in range(len(X)):
+        for j in range(len(X)):
             s = 0
-            for a, sv_y, sv in zip(self.a, self.sv_y, self.sv):
-                s += a * sv_y * self.kernel.func(X[i], sv)
-            y_predict[i] = s + self.b
+            for alpha, yi, xi in zip(
+                self.alphas, self.support_vect_y, self.support_vect_x
+            ):
+                s += alpha * yi * self.kernel(X[j], xi)
+            y_predict[j] = s + self.bias
         return y_predict
-    
-    
-dataframe = pd.read_csv("winequality-red.csv", sep=';')
-dataframe['quality'] = dataframe['quality'].apply(lambda x: 1 if x >= 6 else -1)
-    
-y = np.array(dataframe.loc[:, 'quality'])
-X = dataframe.iloc[:, :-1]
 
-enc = OrdinalEncoder()
-enc.fit(X)
-X = enc.transform(X)
 
-scaler = MinMaxScaler()
-scaler.fit(X)
-X = scaler.transform(X)
+def transform_data(X):
+    enc = OrdinalEncoder().fit(X)
+    X = enc.transform(X)
 
-X_train, X_test, y_train, y_test = train_test_split(
+    scaler = MinMaxScaler().fit(X)
+    return scaler.transform(X)
+
+
+if __name__ == "__main__":
+    kernel = RBFKernel(gamma=16)
+    # kernel = PolyKernel(c=6, d=4)
+    hiperparams = hiperparams_t(kernel, C=1.0)
+    params = params_t("winequality-red.csv", "quality", 6)
+
+    dataframe = pd.read_csv(params.file_name, sep=";")
+    dataframe[params.column_name] = dataframe[params.column_name].apply(
+        lambda x: 1 if x >= params.minimum_quality else -1
+    )
+
+    y = np.array(dataframe.loc[:, params.column_name])
+    X = dataframe.iloc[:, :-1]
+    X = transform_data(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
 
-kernel = "rbf"
-if kernel == "rbf":
-    #kernel rbf
-    rbf_kernel = RBFKernel(gamma=16) #16 duzo, 80procent
-    rbf_kernel_clf = SVM(kernel=rbf_kernel, C=1.0) #C=1
-    rbf_kernel_clf.fit(X_train, y_train)
-    rbf_predictions = rbf_kernel_clf.predict(X_test)
-    rbf_accuracy = accuracy_score(y_true=y_test, y_pred=rbf_predictions)
-    rbf_precision = precision_score(y_true=y_test, y_pred=rbf_predictions)
-    print(rbf_accuracy)
-    
-elif kernel == "linear":
-    #linear kernel
-    lin_kernel = LinearKernel() #75procent
-    lin_kernel_clf = SVM(kernel=lin_kernel, C=10) #C=10
-    lin_kernel_clf.fit(X_train, y_train)
-    lin_predictions = lin_kernel_clf.predict(X_test)
-    lin_accuracy = accuracy_score(y_true=y_test, y_pred=lin_predictions)
-    lin_precision = precision_score(y_true=y_test, y_pred=lin_predictions)
-    print(lin_accuracy)
-    
-else:
-    #poly kernel
-    poly_kernel = PolyKernel(c=6, d=4) #80,9procent, c=6, d=4
-    poly_kernel_clf = SVM(kernel=poly_kernel) 
-    poly_kernel_clf.fit(X_train, y_train)
-    poly_predictions = poly_kernel_clf.predict(X_test)
-    poly_accuracy = accuracy_score(y_true=y_test, y_pred=poly_predictions)
-    poly_precision = precision_score(y_true=y_test, y_pred=poly_predictions)
-    print(poly_accuracy)
-    
+    svm_algorithm = SVM(hiperparams)
+    svm_algorithm.fit(X_train, y_train)
+    predictions = svm_algorithm.predict(X_test)
+    accuracy = accuracy_score(y_test, predictions)
+    print(accuracy)
